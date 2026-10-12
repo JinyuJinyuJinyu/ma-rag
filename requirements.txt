@@ -1,0 +1,42 @@
+# Azure Services
+azure-ai-formrecognizer>=3.3.0,<4.0.0
+azure-search-documents==11.4.0
+azure-identity==1.15.0
+applicationinsights==0.11.10
+opencensus-ext-azure==1.1.13
+
+# LangChain and AI - using compatible versions
+langchain>=0.3.0,<0.4.0
+langchain-openai>=0.2.0,<0.4.0
+langchain-core>=0.3.0,<0.4.0
+langgraph>=0.2.0,<0.7.0
+openai>=1.6.1,<2.0.0
+
+# FastAPI and Web
+fastapi>=0.115.2,<1.0.0
+uvicorn[standard]>=0.31.1,<1.0.0
+python-multipart>=0.0.6,<0.1.0
+pydantic>=2.5.3,<3.0.0
+pydantic-settings>=2.1.0,<3.0.0
+
+# MCP + A2A protocol integration
+mcp[cli]>=1.27,<2
+a2a-sdk[http-server]==1.1.0
+sse-starlette>=2.1,<3.0
+openpyxl>=3.1,<4.0
+
+# Our data: split PDFs for the Document Intelligence Free tier, parse DOCX safely
+pypdf>=5,<7
+defusedxml>=0.7,<1.0
+
+# Utilities
+python-dotenv>=1.0.0
+aiohttp>=3.9.1,<4.0.0
+requests>=2.31.0,<3.0.0
+typing-extensions>=4.9.0
+
+# Development and Testing (optional)
+pytest>=7.4.3,<8.0.0
+pytest-asyncio>=0.21.1,<0.22.0
+black>=23.12.1,<24.0.0
+flake8>=7.0.0,<8.0.0

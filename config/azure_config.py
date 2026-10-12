@@ -1,0 +1,341 @@
+"""
+Azure Services Configuration Module
+
+This module loads and validates all Azure service credentials and endpoints
+from environment variables. It implements security best practices:
+- No hardcoded secrets
+- Environment variable validation at startup
+- Masked logging of sensitive data
+- Support for Azure Managed Identity (recommended for production)
+
+Security Note:
+    In production environments, use Azure Managed Identity instead of API keys.
+    This provides automatic credential rotation and eliminates the need to
+    store secrets in environment variables.
+    See: https://learn.microsoft.com/azure/developer/python/sdk/authentication-overview
+"""
+
+import os
+from typing import Optional
+from dotenv import load_dotenv
+import logging
+
+# Load environment variables from .env file
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+class ConfigurationError(Exception):
+    """Raised when required configuration is missing or invalid."""
+    pass
+
+
+def _mask_secret(secret: str, show_chars: int = 4) -> str:
+    """
+    Mask a secret string for safe logging.
+
+    Args:
+        secret: The secret string to mask
+        show_chars: Number of characters to show at start and end
+
+    Returns:
+        Masked string showing only first and last few characters
+    """
+    if not secret or len(secret) <= show_chars * 2:
+        return "***"
+    return f"{secret[:show_chars]}...{secret[-show_chars:]}"
+
+
+def _get_required_env(var_name: str) -> str:
+    """
+    Get a required environment variable or raise an error.
+
+    Args:
+        var_name: Name of the environment variable
+
+    Returns:
+        Value of the environment variable
+
+    Raises:
+        ConfigurationError: If the environment variable is not set
+    """
+    value = os.getenv(var_name)
+    if not value:
+        raise ConfigurationError(
+            f"Required environment variable '{var_name}' is not set. "
+            f"Please check your .env file."
+        )
+    return value
+
+
+def _get_optional_env(var_name: str, default: str) -> str:
+    """
+    Get an optional environment variable with a default value.
+
+    Args:
+        var_name: Name of the environment variable
+        default: Default value if not set
+
+    Returns:
+        Value of the environment variable or default
+    """
+    return os.getenv(var_name, default)
+
+
+class AzureConfig:
+    """
+    Azure Services Configuration.
+
+    This class loads and validates all Azure service credentials and settings.
+    All values are loaded from environment variables for security.
+    """
+
+    def __init__(self):
+        """Initialize and validate Azure configuration."""
+        try:
+            # Document Intelligence
+            # Strip trailing slashes to prevent double-slash in API URLs
+            self.doc_intelligence_endpoint = _get_required_env("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT").rstrip('/')
+            self.doc_intelligence_key = _get_required_env("AZURE_DOCUMENT_INTELLIGENCE_KEY")
+            # The Free (F0) tier analyzes only the first 2 pages of each request, so PDFs
+            # are sent in pieces of this many pages. 0 sends each PDF whole (paid S0 tier).
+            self.doc_intelligence_pages_per_request = int(
+                _get_optional_env("AZURE_DOCUMENT_INTELLIGENCE_PAGES_PER_REQUEST", "2")
+            )
+
+            # Azure AI Foundry - Embedding Model
+            # CRITICAL: These are separate from Azure OpenAI Service
+            self.ai_foundry_embedding_endpoint = _get_required_env("AZURE_AI_FOUNDRY_EMBEDDING_ENDPOINT").rstrip('/')
+            self.ai_foundry_embedding_deployment = _get_required_env("AZURE_AI_FOUNDRY_EMBEDDING_DEPLOYMENT_NAME")
+            self.ai_foundry_embedding_key = _get_required_env("AZURE_AI_FOUNDRY_EMBEDDING_API_KEY")
+            self.ai_foundry_embedding_api_version = _get_optional_env(
+                "AZURE_AI_FOUNDRY_EMBEDDING_API_VERSION",
+                "2024-08-01-preview"
+            )
+
+            # Azure AI Foundry - GPT-4 Model
+            # CRITICAL: These are separate from Azure OpenAI Service
+            self.ai_foundry_gpt4_endpoint = _get_required_env("AZURE_AI_FOUNDRY_GPT4_ENDPOINT").rstrip('/')
+            self.ai_foundry_gpt4_deployment = _get_required_env("AZURE_AI_FOUNDRY_GPT4_DEPLOYMENT_NAME")
+            self.ai_foundry_gpt4_key = _get_required_env("AZURE_AI_FOUNDRY_GPT4_API_KEY")
+            self.ai_foundry_gpt4_api_version = _get_optional_env(
+                "AZURE_AI_FOUNDRY_GPT4_API_VERSION",
+                "2024-08-01-preview"
+            )
+
+            # Azure AI Search
+            self.search_endpoint = _get_required_env("AZURE_SEARCH_ENDPOINT").rstrip('/')
+            self.search_admin_key = _get_required_env("AZURE_SEARCH_ADMIN_KEY")
+            self.search_index_name = _get_optional_env("AZURE_SEARCH_INDEX_NAME", "ai-earnings-desk")
+
+            # Azure Application Insights
+            self.app_insights_connection_string = _get_required_env("APPLICATIONINSIGHTS_CONNECTION_STRING")
+
+            # Application Settings
+            self.chunk_size = int(_get_optional_env("CHUNK_SIZE", "1200"))
+            self.chunk_overlap = float(_get_optional_env("CHUNK_OVERLAP", "0.2"))
+            self.retrieval_top_k = int(_get_optional_env("RETRIEVAL_TOP_K", "5"))
+            self.llm_temperature = float(_get_optional_env("LLM_TEMPERATURE", "0.7"))
+
+            # Guardrail Settings
+            self.guardrail_enabled = _get_optional_env("GUARDRAIL_ENABLED", "true").lower() == "true"
+            self.guardrail_strictness = _get_optional_env("GUARDRAIL_STRICTNESS", "medium").lower()
+
+            # Session Management Settings
+            self.session_timeout_minutes = int(_get_optional_env("SESSION_TIMEOUT_MINUTES", "30"))
+            self.conversation_memory_turns = int(_get_optional_env("CONVERSATION_MEMORY_TURNS", "1"))
+
+            # Azure AI Content Safety Guardrails (input + output)
+            # Optional: if endpoint/key are unset, guardrails pass through (no-op).
+            self.content_safety_endpoint = _get_optional_env("AZURE_CONTENT_SAFETY_ENDPOINT", "").rstrip('/')
+            self.content_safety_key = _get_optional_env("AZURE_CONTENT_SAFETY_KEY", "")
+            self.content_safety_api_version = _get_optional_env("AZURE_CONTENT_SAFETY_API_VERSION", "2024-09-01")
+            self.content_safety_block_severity = int(_get_optional_env("AZURE_CONTENT_SAFETY_BLOCK_SEVERITY", "4"))
+            # Per-category severity thresholds (0/2/4/6). Default: strict on Hate/Sexual (2),
+            # lenient on SelfHarm/Violence (4) so ordinary risk-factor language in filings and
+            # earnings calls (wars, conflicts, attacks) is not false-flagged. Each falls back to
+            # the global threshold if unset.
+            _default_sev = str(self.content_safety_block_severity)
+            self.content_safety_category_thresholds = {
+                "Hate": int(_get_optional_env("AZURE_CONTENT_SAFETY_SEVERITY_HATE", "2")),
+                "Sexual": int(_get_optional_env("AZURE_CONTENT_SAFETY_SEVERITY_SEXUAL", "2")),
+                "SelfHarm": int(_get_optional_env("AZURE_CONTENT_SAFETY_SEVERITY_SELFHARM", "4")),
+                "Violence": int(_get_optional_env("AZURE_CONTENT_SAFETY_SEVERITY_VIOLENCE", "4")),
+            }
+            self.input_guardrail_enabled = _get_optional_env("INPUT_GUARDRAIL_ENABLED", "true").lower() == "true"
+            self.output_guardrail_enabled = _get_optional_env("OUTPUT_GUARDRAIL_ENABLED", "true").lower() == "true"
+
+            # Validate configuration
+            self._validate()
+
+            logger.info("Azure configuration loaded successfully")
+            self._log_config()
+
+        except ConfigurationError as e:
+            logger.error(f"Configuration error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error loading configuration: {e}")
+            raise ConfigurationError(f"Failed to load configuration: {e}")
+
+    def _validate(self):
+        """Validate configuration values."""
+        # Validate endpoints are URLs
+        endpoints = [
+            self.doc_intelligence_endpoint,
+            self.ai_foundry_embedding_endpoint,
+            self.ai_foundry_gpt4_endpoint,
+            self.search_endpoint
+        ]
+        for endpoint in endpoints:
+            if not endpoint.startswith(("http://", "https://")):
+                raise ConfigurationError(f"Invalid endpoint URL: {endpoint}")
+
+        # Validate numeric ranges
+        if self.doc_intelligence_pages_per_request < 0:
+            raise ConfigurationError(
+                f"AZURE_DOCUMENT_INTELLIGENCE_PAGES_PER_REQUEST must be 0 or more, "
+                f"got {self.doc_intelligence_pages_per_request}"
+            )
+
+        if not 100 <= self.chunk_size <= 10000:
+            raise ConfigurationError(f"CHUNK_SIZE must be between 100 and 10000, got {self.chunk_size}")
+
+        if not 0.0 <= self.chunk_overlap <= 1.0:
+            raise ConfigurationError(f"CHUNK_OVERLAP must be between 0.0 and 1.0, got {self.chunk_overlap}")
+
+        if not 1 <= self.retrieval_top_k <= 100:
+            raise ConfigurationError(f"RETRIEVAL_TOP_K must be between 1 and 100, got {self.retrieval_top_k}")
+
+        if not 0.0 <= self.llm_temperature <= 2.0:
+            raise ConfigurationError(f"LLM_TEMPERATURE must be between 0.0 and 2.0, got {self.llm_temperature}")
+
+        # Validate guardrail settings
+        if self.guardrail_strictness not in ["low", "medium", "high"]:
+            raise ConfigurationError(
+                f"GUARDRAIL_STRICTNESS must be 'low', 'medium', or 'high', got '{self.guardrail_strictness}'"
+            )
+
+        # Validate session settings
+        if not 1 <= self.session_timeout_minutes <= 1440:  # 1 minute to 24 hours
+            raise ConfigurationError(
+                f"SESSION_TIMEOUT_MINUTES must be between 1 and 1440, got {self.session_timeout_minutes}"
+            )
+
+        if self.conversation_memory_turns != 1:
+            logger.warning(
+                f"CONVERSATION_MEMORY_TURNS is set to {self.conversation_memory_turns}, "
+                f"but currently only 1 (previous turn) is supported. Using 1."
+            )
+            self.conversation_memory_turns = 1
+
+    def _log_config(self):
+        """Log configuration (with masked secrets) for debugging."""
+        logger.info("=" * 60)
+        logger.info("Azure Configuration:")
+        logger.info("-" * 60)
+        logger.info(f"Document Intelligence Endpoint: {self.doc_intelligence_endpoint}")
+        logger.info(f"Document Intelligence Key: {_mask_secret(self.doc_intelligence_key)}")
+        logger.info(f"Document Intelligence Pages per Request: {self.doc_intelligence_pages_per_request or 'whole file'}")
+        logger.info("-" * 60)
+        logger.info(f"AI Foundry Embedding Endpoint: {self.ai_foundry_embedding_endpoint}")
+        logger.info(f"AI Foundry Embedding Deployment: {self.ai_foundry_embedding_deployment}")
+        logger.info(f"AI Foundry Embedding Key: {_mask_secret(self.ai_foundry_embedding_key)}")
+        logger.info(f"AI Foundry Embedding API Version: {self.ai_foundry_embedding_api_version}")
+        logger.info("-" * 60)
+        logger.info(f"AI Foundry GPT-4 Endpoint: {self.ai_foundry_gpt4_endpoint}")
+        logger.info(f"AI Foundry GPT-4 Deployment: {self.ai_foundry_gpt4_deployment}")
+        logger.info(f"AI Foundry GPT-4 Key: {_mask_secret(self.ai_foundry_gpt4_key)}")
+        logger.info(f"AI Foundry GPT-4 API Version: {self.ai_foundry_gpt4_api_version}")
+        logger.info("-" * 60)
+        logger.info(f"Azure Search Endpoint: {self.search_endpoint}")
+        logger.info(f"Azure Search Admin Key: {_mask_secret(self.search_admin_key)}")
+        logger.info(f"Azure Search Index Name: {self.search_index_name}")
+        logger.info("-" * 60)
+        logger.info(f"App Insights Connection String: {_mask_secret(self.app_insights_connection_string, 10)}")
+        logger.info("-" * 60)
+        logger.info(f"Chunk Size: {self.chunk_size}")
+        logger.info(f"Chunk Overlap: {self.chunk_overlap}")
+        logger.info(f"Retrieval Top K: {self.retrieval_top_k}")
+        logger.info(f"LLM Temperature: {self.llm_temperature}")
+        logger.info("-" * 60)
+        logger.info(f"Guardrail Enabled: {self.guardrail_enabled}")
+        logger.info(f"Guardrail Strictness: {self.guardrail_strictness}")
+        logger.info("-" * 60)
+        logger.info(f"Session Timeout: {self.session_timeout_minutes} minutes")
+        logger.info(f"Conversation Memory Turns: {self.conversation_memory_turns}")
+        logger.info("=" * 60)
+
+    def get_optional_env(self, var_name: str, default: str) -> str:
+        """
+        Get an optional environment variable with a default value.
+
+        This is a wrapper around _get_optional_env for external use.
+
+        Args:
+            var_name: Name of the environment variable
+            default: Default value if not set
+
+        Returns:
+            Value of the environment variable or default
+        """
+        return _get_optional_env(var_name, default)
+
+
+# Global configuration instance
+# This will be initialized when the module is imported
+_config: Optional[AzureConfig] = None
+
+
+def get_config() -> AzureConfig:
+    """
+    Get the global Azure configuration instance.
+
+    Returns:
+        AzureConfig: The global configuration instance
+
+    Raises:
+        ConfigurationError: If configuration fails to load
+    """
+    global _config
+    if _config is None:
+        _config = AzureConfig()
+    return _config
+
+
+def reload_config() -> AzureConfig:
+    """
+    Reload the configuration from environment variables.
+
+    Useful for testing or when environment variables change.
+
+    Returns:
+        AzureConfig: The new configuration instance
+    """
+    global _config
+    _config = AzureConfig()
+    return _config
+
+
+# Production Security Note:
+# ========================
+# For production deployments, consider using Azure Managed Identity instead of API keys:
+#
+# from azure.identity import DefaultAzureCredential
+#
+# credential = DefaultAzureCredential()
+#
+# This approach:
+# - Eliminates the need to store API keys
+# - Provides automatic credential rotation
+# - Enables fine-grained RBAC
+# - Works seamlessly in Azure-hosted environments (App Service, Container Apps, VMs, etc.)
+#
+# Example usage with Azure Search:
+# from azure.search.documents import SearchClient
+# search_client = SearchClient(
+#     endpoint=search_endpoint,
+#     index_name=index_name,
+#     credential=credential
+# )
