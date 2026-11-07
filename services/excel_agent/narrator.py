@@ -15,6 +15,11 @@ configured, a 2-3 sentence LLM-generated summary is inserted between the
 header paragraph and the row sentences. The LLM step is best-effort: any
 failure (missing creds, network error, bad response, ...) falls back to the
 deterministic output, so this agent always works fully offline.
+
+Column views (deterministic, on unless EXCEL_AGENT_COLUMN_VIEWS=false): after
+every sheet, the workbook text lists each column down every row, so a question
+about one column (the lowest margin of eight companies, a twelve-quarter
+average) finds its rows in a few passages instead of one chunk per row.
 """
 
 from __future__ import annotations
@@ -34,6 +39,9 @@ from openai import AzureOpenAI
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = {".xlsx", ".csv"}
+
+# A column view's passages stay under this many characters, so each fits in one chunk and names its column
+COLUMN_PASSAGE_CHARS = 900
 
 # Environment variables consulted for the optional per-sheet LLM summary.
 # Read directly from the process environment (never from the main project's
@@ -132,6 +140,47 @@ def _narrate_row(sheet_name: str, headers: list[str], row: list) -> str:
     return f"{sheet_name} — {subject_header} '{subject_value}': {'; '.join(clauses)}."
 
 
+def _is_number(value: str) -> bool:
+    try:
+        float(value.replace(",", ""))
+    except ValueError:
+        return False
+    return True
+
+
+def _skip_column(subjects: list[str], values: list[str | None]) -> bool:
+    """A column with nothing to list down the rows: empty, one value throughout, every value already part of
+    its row's subject (Company in 'NVIDIA CY2025 Q1'), or a few labels repeated (a ticker per company)."""
+    present = [(s, v) for s, v in zip(subjects, values) if v is not None]
+    distinct = {v for _, v in present}
+    if len(distinct) <= 1 or all(v in s for s, v in present):
+        return True
+    return not all(_is_number(v) for v in distinct) and len(distinct) <= len(subjects) / 8
+
+
+def _narrate_columns(sheet: ParsedSheet, max_chars: int = COLUMN_PASSAGE_CHARS) -> list[str]:
+    """Each column but the first, down every row, as passages of at most max_chars that each repeat the
+    sheet and column: "Revenue — column 'CY2025 Q1', by Company: NVIDIA is 44062; AMD is 7438; ..."."""
+    if len(sheet.data_rows) < 2 or len(sheet.headers) < 2:
+        return []
+    subject_header = sheet.headers[0]
+    subjects = [(_format_value(row[0]) if row else None) or "(unspecified)" for row in sheet.data_rows]
+    passages = []
+    for index, header in enumerate(sheet.headers[1:], start=1):
+        values = [_format_value(row[index]) if index < len(row) else None for row in sheet.data_rows]
+        if _skip_column(subjects, values):
+            continue
+        prefix = f"{sheet.name} — column '{header}', by {subject_header}: "
+        entries, current = [f"{s} is {v}" for s, v in zip(subjects, values) if v is not None], []
+        for entry in entries:
+            if current and len(prefix) + len("; ".join(current + [entry])) + 1 > max_chars:
+                passages.append(prefix + "; ".join(current) + ".")
+                current = []
+            current.append(entry)
+        passages.append(prefix + "; ".join(current) + ".")
+    return passages
+
+
 class ExcelNarrator:
     """Converts spreadsheet bytes into descriptive natural-language passages.
 
@@ -146,6 +195,7 @@ class ExcelNarrator:
 
     def __init__(self) -> None:
         self.use_llm = self._llm_enabled()
+        self.column_views = os.environ.get("EXCEL_AGENT_COLUMN_VIEWS", "true").strip().lower() != "false"
         self._client: AzureOpenAI | None = None
         if self.use_llm:
             logger.info(
@@ -232,6 +282,13 @@ class ExcelNarrator:
 
         return "\n\n".join(paragraphs)
 
+    def narrate_columns(self, workbook: ParsedWorkbook) -> str:
+        """The column views of every sheet, as one section that goes after the sheets ("" when off)."""
+        if not self.column_views:
+            return ""
+        # Every passage names its sheet and column, so the section needs no heading of its own
+        return "\n\n".join("\n".join(passages) for passages in map(_narrate_columns, workbook.sheets) if passages)
+
     def iter_sheets(self, data: bytes, filename: str) -> Iterator[tuple[str, str]]:
         """Convenience generator yielding (sheet_name, sheet_text) per sheet.
 
@@ -248,8 +305,9 @@ class ExcelNarrator:
         """Parse and narrate every sheet, returning the full result at once."""
         workbook = self.load(data, filename)
         sheet_texts = [self.narrate_sheet(workbook, sheet) for sheet in workbook.sheets]
+        column_text = self.narrate_columns(workbook)
         return {
-            "text": "\n\n".join(sheet_texts),
+            "text": "\n\n".join(sheet_texts + ([column_text] if column_text else [])),
             "sheet_count": len(workbook.sheets),
             "sheet_names": workbook.sheet_names,
             "row_count": workbook.row_count,

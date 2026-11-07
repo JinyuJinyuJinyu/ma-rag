@@ -6,7 +6,7 @@ The code is adapted from [`multiagent-rag`](https://github.com/dukewillbe185/mul
 
 **Setting up Azure:** [`docs/AZURE_SETUP.md`](docs/AZURE_SETUP.md) walks through the Azure portal step by step, gives a `.env` template, and ends with `python scripts/check_azure.py`, which tests every setting with one small real call per service.
 
-**Evaluating:** [`docs/EVALUATION.md`](docs/EVALUATION.md) explains how the answers are scored (retrieval, exact numbers, RAGAS, guardrail checks and an XLSX ablation) and how to run `scripts/run_eval.py` and `scripts/eval_score.py`.
+**Evaluating:** [`docs/EVALUATION.md`](docs/EVALUATION.md) explains the two evals and how to run them. Both use one golden set of 148 verified questions (`evaluation/golden_set.yaml`), from easy to hard: every indexed file is required by at least three of them, 33 need facts from two or more files, and 48 are vertical questions, which read one workbook column down many rows (the case a row-by-row index splits into many passages). `scripts/eval_retrieval.py` checks whether search brings back the passages that hold each answer. `scripts/eval_answers.py` checks the answers themselves: exact figures, an LLM judge (RAGAS), guardrail checks, follow-up conversations and an XLSX ablation.
 
 ## Table of Contents
 
@@ -78,10 +78,12 @@ The architecture and the code are the reference's. The differences:
 - **HTML and DOCX:** a new local extractor. `main.py process` sends `.html`, `.htm` and `.docx` files to it.
 - **PDFs on the Free tier:** `DocumentExtractor` splits PDFs into pieces of `AZURE_DOCUMENT_INTELLIGENCE_PAGES_PER_REQUEST` pages (default 2; 0 sends the whole file). New dependencies: `pypdf` and `defusedxml`.
 - **`main.py ingest`:** indexes the planned selection (`--tier 1|2|all`, `--types pdf,html,docx,xlsx`, `--dry-run`).
-- **Guardrail agent:** its prompt describes the indexed corpus, checks for prompt injection first, and no longer rejects a question because its date (such as 2026) looks like the future. An unsafe rejection's reason always starts with "Unsafe:".
+- **Guardrail agent:** its prompt describes the indexed corpus, checks for prompt injection first, and no longer rejects a question because its date (such as 2026) looks like the future, or because it names a fiscal period ("Q2 FY27") or uses tickers and abbreviations. It runs at temperature 0, whatever `LLM_TEMPERATURE` says: at 0.7 the same legitimate question sometimes passed and sometimes was rejected. An unsafe rejection's reason always starts with "Unsafe:". When Azure OpenAI's own content filter rejects the guardrail's call, the question is treated as unsafe instead of being let through; other guardrail errors still let it through ("fail open"). With `GUARDRAIL_ENABLED=false` the guardrail makes no LLM call, and the API answers instead of rejecting.
+- **Follow-up questions:** from the second turn of a session, the retrieval agent rewrites a follow-up ("And a year earlier?") into a standalone search query, using the previous question and answer for context. Before, it searched with the bare follow-up and found nothing useful.
 - **Fixes:** `main.py query` passes the guardrail settings; with the guardrail disabled, `query()` no longer swaps a real answer for a rejection message; `requirements.txt` moves to LangChain 0.3, LangGraph 0.6 and FastAPI 0.115+; and the Application Insights logger sends nothing while the connection string is the `.env.example` placeholder.
-- **New tools:** `scripts/check_azure.py` with [`docs/AZURE_SETUP.md`](docs/AZURE_SETUP.md), and the evaluation harness (`evaluation/`, `scripts/run_eval.py`, `scripts/eval_score.py`, `tests/`; see [`docs/EVALUATION.md`](docs/EVALUATION.md)).
-- **Unchanged on purpose:** the other agents and their prompts, the API routes (upload still accepts PDFs only), the MCP tools and the A2A code.
+- **API:** `/api/v1/query` also returns `guardrail_reason` (why the guardrail passed or rejected the question; for a guardrail error, only the error type) and `retrieval_query` (what was searched, the rewritten query for a follow-up). Both are model-written, so they go through the output Content Safety check with the answer, and come back null if it flags them. The guardrail's verdict is read more robustly: a verdict wrapped in a code block or with extra text still counts, and "unsafe" always wins.
+- **New tools:** `scripts/check_azure.py` with [`docs/AZURE_SETUP.md`](docs/AZURE_SETUP.md), and the two evals (`evaluation/`, `scripts/eval_retrieval.py`, `scripts/eval_answers.py`, `tests/`; see [`docs/EVALUATION.md`](docs/EVALUATION.md)). The retriever gained `search()` with hybrid, vector and keyword modes and an optional filter; `retrieve()` works as before.
+- **Unchanged on purpose:** the intent and answer agents and their prompts, the other API routes (upload still accepts PDFs only), the MCP tools and the A2A code.
 - **Not copied:** `outputs/` (the reference's slides and diagrams) and `docs/superpowers/` (the reference's design notes).
 
 ## Architecture
@@ -448,6 +450,11 @@ APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=...
 CHUNK_SIZE=1200
 CHUNK_OVERLAP=0.2
 RETRIEVAL_TOP_K=5
+RETRIEVAL_HYBRID_KNN=50
+RETRIEVAL_WORKBOOK_EXPAND=20
+RETRIEVAL_WORKBOOK_TRIGGER=3
+RETRIEVAL_COMPANY_ROUTING=false
+RETRIEVAL_SINGLE_COMPANY_TOP_K=0
 LLM_TEMPERATURE=0.7
 
 # 🆕 Guardrail Settings
@@ -697,7 +704,9 @@ curl -X POST "http://127.0.0.1:8020/api/v1/query" \
   ],
   "sources": ["ai_earnings_comparison.xlsx"],
   "processing_time_seconds": 2.3,
-  "guardrail_passed": true
+  "guardrail_passed": true,
+  "guardrail_reason": "Question about the revenue of covered companies",
+  "retrieval_query": "Which company had the highest revenue in calendar Q2 2026?"
 }
 ```
 
@@ -714,7 +723,9 @@ curl -X POST "http://127.0.0.1:8020/api/v1/query" \
   "retrieved_chunks": [],
   "sources": [],
   "processing_time_seconds": 0.5,
-  "guardrail_passed": false
+  "guardrail_passed": false,
+  "guardrail_reason": "Weather is unrelated to the indexed documents",
+  "retrieval_query": null
 }
 ```
 
@@ -724,7 +735,8 @@ curl -X POST "http://127.0.0.1:8020/api/v1/query" \
 curl -X POST "http://127.0.0.1:8020/api/v1/query" \
   -d '{"question": "How much revenue did NVIDIA report for calendar Q2 2026?", "session_id": "session_123"}'
 
-# Follow-up question (uses conversation memory)
+# Follow-up question (uses conversation memory; the response's retrieval_query shows the
+# standalone query it was rewritten into, e.g. "NVIDIA revenue in calendar Q2 2025")
 curl -X POST "http://127.0.0.1:8020/api/v1/query" \
   -d '{"question": "And a year earlier?", "session_id": "session_123"}'
 ```
@@ -792,16 +804,19 @@ ma-rag/
 │   ├── AZURE_SETUP.md               # Step-by-step Azure setup and the .env template
 │   ├── EVALUATION.md                # How the system is evaluated, in plain words, and how to run it
 │   └── mcp-a2a-teaching-guide.md    # Classroom walkthrough for both demos (Chinese)
-├── evaluation/                      # The evaluation harness (see docs/EVALUATION.md)
-│   ├── gold_questions.yaml          # The 19 demo questions with their verified answers
-│   ├── scoring.py                   # Exact scorers: numbers, mentions, retrieval, guardrail checks
-│   └── gold.py, probe.py, collect.py, judge.py, report.py
+├── evaluation/                      # The two evals (see docs/EVALUATION.md)
+│   ├── golden_set.yaml              # The questions, verified answers, checks and retrieval evidence
+│   ├── gold.py, evidence.py         # Load the golden set; match chunks to its evidence
+│   ├── retrieval.py, snapshot.py    # The retrieval eval; the index snapshot and check-gold
+│   └── scoring.py, probe.py, collect.py, judge.py, report.py   # The answer eval
 ├── scripts/
 │   ├── check_azure.py               # Tests each .env setting with one small real call per service
-│   ├── run_eval.py                  # Evaluation stage 1: ask the gold questions, record the results
-│   └── eval_score.py                # Evaluation stage 2: score a run, write the scorecard
+│   ├── eval_retrieval.py            # Retrieval eval: snapshot, check-gold, run, score
+│   └── eval_answers.py              # Answer eval: run (ask the questions), score (exact checks + judge)
 ├── tests/
-│   └── test_eval_scoring.py         # Offline tests for the evaluation harness
+│   ├── test_eval_retrieval.py       # Offline tests for the retrieval eval
+│   ├── test_eval_answers.py         # Offline tests for the answer eval
+│   └── test_app_fixes.py            # Offline tests for the guardrail and follow-up behaviour
 ├── langgraph_test.py               # Multi-agent blueprint
 ├── main.py                         # CLI orchestration script
 ├── requirements.txt                # Python dependencies
@@ -1011,14 +1026,44 @@ CHUNK_OVERLAP=0.2        # Higher = more overlap, better continuity
 ### Retrieval Tuning
 
 ```bash
-RETRIEVAL_TOP_K=5        # Number of chunks to retrieve
+RETRIEVAL_TOP_K=5             # Number of chunks to retrieve
+RETRIEVAL_HYBRID_KNN=50       # Vector neighbours fused with the keyword results in hybrid search (at least top_k)
+RETRIEVAL_WORKBOOK_EXPAND=20  # Up to this many extra workbook chunks for workbook questions (0: off)
+RETRIEVAL_WORKBOOK_TRIGGER=3  # ...when this many of the top_k results are workbook chunks
+RETRIEVAL_COMPANY_ROUTING=false  # true: search each company a question names (up to 3) on its own
+RETRIEVAL_SINGLE_COMPANY_TOP_K=0  # ...and give a question naming one company this many results (0: top_k)
 ```
+
+Hybrid search fuses the keyword (BM25) results with the vector neighbours. With only `top_k` neighbours,
+every neighbour also matches some keyword of a long question, so the fusion always ranks them first and
+hybrid returns exactly the vector top `top_k`; 50 neighbours let keyword-only chunks in.
+
+Workbook expansion helps questions that read one column down many rows ("which of the eight companies had
+the lowest margin"): the Excel narrator writes one sentence per row, so the rows sit in many chunks. When
+the top results are mostly workbook chunks, a second search over the workbooks adds more of them.
+
+Company routing (`RETRIEVAL_COMPANY_ROUTING=true`, off by default until the evals measure it) helps document
+passages that never name their company, such as a segment table or a later paragraph of a press release:
+they lose to passages that do, from other companies' documents and the workbook rows. A question that names
+one to three of the eight companies (by name, ticker or a product such as Xbox or EPYC) searches each
+company's chunks, plus the comparison workbook's, on its own (the filter `ticker eq 'AMD' or ticker eq
+null`) and merges the results rank by rank, so each company it names gets `top_k` results. Other questions
+run one search as before. With `RETRIEVAL_SINGLE_COMPANY_TOP_K` set (to 10, say), a question that names
+just one company gets that many results instead: all of them are that company's chunks or workbook rows,
+and the passage it needs often sits just below the top 5, among the same file's passages.
+
+The Excel narrator also follows each workbook's sheets with **column views** (`EXCEL_AGENT_COLUMN_VIEWS=true`,
+the default): each column down every row, in passages that name the sheet and column, so a column's values
+sit in a few chunks. For a workbook indexed before column views existed, `python scripts/add_column_views.py
+<file>` adds them without re-ingesting it (`--dry-run` to preview, `--delete` to remove them).
 
 ### LLM Temperature
 
 ```bash
 LLM_TEMPERATURE=0.7      # Lower = more focused, Higher = more creative
 ```
+
+The guardrail agent ignores this setting and always runs at 0, so the same question always gets the same verdict.
 
 ## Contributing
 

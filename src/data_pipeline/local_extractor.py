@@ -10,7 +10,8 @@ so these files use none of the Document Intelligence page quota.
   Scripts and styles are skipped.
 - DOCX: body paragraphs and tables in document order.
 
-Tables become one line per row with cells joined by " | ". Files are parsed as
+Tables become one line per row with cells joined by " | "; a table inside a
+DOCX table cell follows its row, one line per row too. Files are parsed as
 data only (stdlib HTMLParser; zipfile + defusedxml for DOCX); nothing in them
 is executed.
 """
@@ -225,17 +226,34 @@ class LocalExtractor:
 
         lines = []
 
+        def cell_content(element, texts, inner_tables):
+            # A cell's paragraphs, in order; a table inside the cell is set aside
+            # so its rows keep their own lines instead of merging into this cell
+            for child in element:
+                if child.tag == _W + "p":
+                    texts.append(text_of(child))
+                elif child.tag == _W + "tbl":
+                    inner_tables.append(child)
+                else:
+                    cell_content(child, texts, inner_tables)
+
+        def table(tbl):
+            for row in tbl.findall(_W + "tr"):
+                cells, inner_tables = [], []
+                for cell in row.findall(_W + "tc"):
+                    texts = []
+                    cell_content(cell, texts, inner_tables)
+                    cells.append(" ".join(texts))
+                lines.append(" | ".join(cells))
+                for inner in inner_tables:  # each nested table's rows follow its row
+                    table(inner)
+
         def walk(element):
             for child in element:
                 if child.tag == _W + "p":
                     lines.append(text_of(child))
                 elif child.tag == _W + "tbl":
-                    for row in child.findall(_W + "tr"):
-                        cells = [
-                            " ".join(text_of(p) for p in cell.iter(_W + "p"))
-                            for cell in row.findall(_W + "tc")
-                        ]
-                        lines.append(" | ".join(cells))
+                    table(child)
                 else:
                     walk(child)
 

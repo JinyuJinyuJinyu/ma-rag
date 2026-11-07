@@ -187,7 +187,9 @@ class ExcelNarratorExecutor(AgentExecutor):
             )
             sheet_texts.append(sheet_text)
 
-        full_text = "\n\n".join(sheet_texts)
+        # The column views go after every sheet, so the row passages keep their place in the text
+        column_text = await asyncio.to_thread(self.narrator.narrate_columns, workbook)
+        full_text = "\n\n".join(sheet_texts + ([column_text] if column_text else []))
 
         # An artifact's parts can freely mix content types: here the same
         # artifact carries both the narrated text (the actual RAG payload)

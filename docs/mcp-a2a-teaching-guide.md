@@ -161,7 +161,7 @@ Sheet metadata from agent data part: 13 sheet(s): Quarterly results, Revenue, Re
 ✓ Indexed <N> chunks
 ```
 
-> 具体的字符数/分片数每次运行可能略有不同——默认 `EXCEL_AGENT_USE_LLM=true`,每个 sheet 会多出一段 LLM 生成的摘要,遣词造句不完全可复现(关掉 LLM 时实测为 141,131 个字符、174 个分片)。但工作簿里逐行的确定性模板句子(不依赖 LLM)保证了关键事实永远不变,这也是为什么下面步骤 5 的答案要点稳定可复现:工作簿由 `datasets/ai-earnings-desk/scripts/build_comparison.py` 从 SEC XBRL 数据确定性地生成,Rankings 表里 "Highest revenue, CY2026 Q2" 一行永远是 Alphabet 119,796(百万美元)、第二名 NVIDIA 96,221。
+> 具体的字符数/分片数每次运行可能略有不同——默认 `EXCEL_AGENT_USE_LLM=true`,每个 sheet 会多出一段 LLM 生成的摘要,遣词造句不完全可复现(关掉 LLM 时实测为 251,433 个字符、309 个分片,其中 135 个分片是列视图;再设 `EXCEL_AGENT_COLUMN_VIEWS=false` 关掉列视图,则为 141,131 个字符、174 个分片)。但工作簿里逐行的确定性模板句子(不依赖 LLM)保证了关键事实永远不变,这也是为什么下面步骤 5 的答案要点稳定可复现:工作簿由 `datasets/ai-earnings-desk/scripts/build_comparison.py` 从 SEC XBRL 数据确定性地生成,Rankings 表里 "Highest revenue, CY2026 Q2" 一行永远是 Alphabet 119,796(百万美元)、第二名 NVIDIA 96,221。
 
 现场讲解重点(结合 Terminal 1 里 Agent 侧同时打印的日志一起看):
 
@@ -258,7 +258,7 @@ EXCEL_AGENT_USE_LLM=false python -m services.excel_agent
 ExcelNarrator: per-sheet LLM summaries DISABLED (deterministic templates only).
 ```
 
-此时 Agent 完全离线工作:每个 sheet 只生成确定性的模板文本(表头段落 + 逐行一句话),不会尝试连接 Azure AI Foundry。适合没有 GPT 部署、或者希望课堂演示 100% 可复现的场景。默认情况下(`EXCEL_AGENT_USE_LLM=true` 且 GPT-4 部署凭证齐全)启动日志会是:
+此时 Agent 完全离线工作:每个 sheet 只生成确定性的模板文本(表头段落 + 逐行一句话),不会尝试连接 Azure AI Foundry。所有 sheet 之后还有确定性的**列视图**(`EXCEL_AGENT_COLUMN_VIEWS=true`,默认开启):把每一列沿着各行再写一遍,例如 `Revenue — column 'CY2025 Q1', by Company: NVIDIA is 44062; AMD is 7438; ...`。逐行叙述会把同一列拆进很多分片,"沿一列往下读很多行"的问题(八家公司里谁的毛利率最低、十二个季度的平均值)有了列视图只需几个分片就能拿到整列。适合没有 GPT 部署、或者希望课堂演示 100% 可复现的场景。默认情况下(`EXCEL_AGENT_USE_LLM=true` 且 GPT-4 部署凭证齐全)启动日志会是:
 ```
 ExcelNarrator: per-sheet LLM summaries ENABLED (Azure AI Foundry GPT-4 deployment).
 ```

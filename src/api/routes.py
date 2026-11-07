@@ -3,12 +3,14 @@ FastAPI route handlers for the Multi-Agent RAG API.
 """
 
 import logging
+import re
 import time
 import tempfile
 import os
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from fastapi import APIRouter, UploadFile, File, HTTPException, status
 from fastapi.responses import JSONResponse
 
@@ -25,7 +27,8 @@ from src.data_pipeline.document_extractor import DocumentExtractor
 from src.data_pipeline.text_chunker import TextChunker
 from src.data_pipeline.embedder import Embedder
 from src.data_pipeline.indexer import AzureSearchIndexer
-from src.agents.rag_agent import MultiAgentRAG, RagState
+from src.agents.rag_agent import (CONTENT_FILTER_REASON, FAIL_OPEN_PREFIX, GUARDRAIL_DISABLED_REASON, MultiAgentRAG,
+                                  RagState)
 from src.guardrails.content_safety import (
     get_guardrail,
     STATUS_CLEAN,
@@ -41,6 +44,34 @@ logger = logging.getLogger(__name__)
 
 # Create router
 router = APIRouter()
+
+_URL = re.compile(r"https?://\S+")
+_ERROR_TYPE = re.compile(r"[A-Za-z_][\w.]*")
+
+
+def _public_guardrail_reason(reason) -> Optional[str]:
+    """
+    The guardrail agent's reason as the API returns it.
+
+    A fail-open keeps only the error type ("Guardrail error (fail-open): RateLimitError"): the raw
+    error text can name endpoints and deployments. URLs are removed and the length is capped. A reason
+    that isn't a string is shown as text rather than breaking the response.
+
+    Args:
+        reason: The guardrail_reason from the workflow state
+
+    Returns:
+        The reason to return, or None when there is none
+    """
+    reason = "" if reason is None else str(reason)
+    if not reason:
+        return None
+    if reason.startswith(FAIL_OPEN_PREFIX):
+        rest = reason[len(FAIL_OPEN_PREFIX):].lstrip(": ")
+        error_type = _ERROR_TYPE.match(rest)
+        ends_type = error_type and rest[error_type.end():error_type.end() + 1] in (":", "")
+        return f"{FAIL_OPEN_PREFIX}: {error_type.group(0)}" if ends_type else FAIL_OPEN_PREFIX
+    return " ".join(_URL.sub("<url>", reason).split())[:300]
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -378,6 +409,7 @@ async def query_documents(request: QueryRequest):
             previous_answer=previous_answer,
             retrieved_chunks=[],
             retrieved_metadata=[],
+            retrieval_query="",
             intent="",
             answer="",
             conversation_turn=conversation_turn,
@@ -389,11 +421,11 @@ async def query_documents(request: QueryRequest):
         logger.info(f"[{session_id}] Starting RAG workflow...")
         result = rag_system.graph.invoke(initial_state)
 
-        # Check if guardrail passed
+        # Check if guardrail passed (a disabled guardrail never rejects)
         guardrail_passed = result.get("guardrail_passed", True)
         guardrail_reason = result.get("guardrail_reason", "")
 
-        if not guardrail_passed:
+        if guardrail_enabled and not guardrail_passed:
             # Guardrail rejected the question
             processing_time = time.time() - start_time
 
@@ -454,6 +486,8 @@ async def query_documents(request: QueryRequest):
                 output_guardrail=STATUS_SKIPPED,
                 input_guardrail_details=input_details,
                 output_guardrail_details=None,
+                guardrail_reason=_public_guardrail_reason(guardrail_reason),
+                retrieval_query=None,
             )
 
         # Guardrail passed - process normally
@@ -485,6 +519,27 @@ async def query_documents(request: QueryRequest):
                 "The generated response was blocked by the output safety guardrail "
                 "(Azure AI Content Safety) before delivery."
             )
+
+        # The guardrail's reason and a rewritten follow-up query are model output too, shaped by the
+        # user's words: check the model-written ones with the same output check (one call), and leave
+        # both out of the response if it flags them. The answer keeps its own check above.
+        public_reason = _public_guardrail_reason(guardrail_reason)
+        retrieval_query = result.get("retrieval_query") or None
+        fixed_reasons = (CONTENT_FILTER_REASON, GUARDRAIL_DISABLED_REASON)
+        model_written = [text for text in (
+            public_reason if public_reason and public_reason not in fixed_reasons
+            and not public_reason.startswith(FAIL_OPEN_PREFIX) else None,
+            retrieval_query if retrieval_query and retrieval_query != question else None,
+        ) if text]
+        if config.output_guardrail_enabled and model_written:
+            extras_gr = guardrail.check_output("\n".join(model_written))
+            if extras_gr.detected:
+                logger.warning(
+                    f"[{session_id}] OUTPUT guardrail flagged the guardrail reason or search query: "
+                    f"{extras_gr.triggered}",
+                    extra={"session_id": session_id, "triggered": extras_gr.triggered}
+                )
+                public_reason = retrieval_query = None
 
         # Build ChunkInfo objects from retrieved metadata
         retrieved_chunks_info = []
@@ -591,6 +646,8 @@ async def query_documents(request: QueryRequest):
             output_guardrail=output_status,
             input_guardrail_details=input_details,
             output_guardrail_details=output_details,
+            guardrail_reason=public_reason,
+            retrieval_query=retrieval_query,
         )
 
     except Exception as e:

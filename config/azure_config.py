@@ -136,6 +136,16 @@ class AzureConfig:
             self.chunk_size = int(_get_optional_env("CHUNK_SIZE", "1200"))
             self.chunk_overlap = float(_get_optional_env("CHUNK_OVERLAP", "0.2"))
             self.retrieval_top_k = int(_get_optional_env("RETRIEVAL_TOP_K", "5"))
+            # Hybrid search fuses the keyword results with this many vector neighbours (at least top_k)
+            self.retrieval_hybrid_knn = int(_get_optional_env("RETRIEVAL_HYBRID_KNN", "50"))
+            # Extra workbook chunks when the top results are mostly workbook chunks (0: off), and how many of
+            # the top results must be workbook chunks
+            self.retrieval_workbook_expand = int(_get_optional_env("RETRIEVAL_WORKBOOK_EXPAND", "20"))
+            self.retrieval_workbook_trigger = int(_get_optional_env("RETRIEVAL_WORKBOOK_TRIGGER", "3"))
+            # A query naming one to three companies searches each one's chunks on its own
+            self.retrieval_company_routing = _get_optional_env("RETRIEVAL_COMPANY_ROUTING", "false").lower() == "true"
+            # ...and a query naming just one gets at least this many of its chunks (0: top_k)
+            self.retrieval_single_company_top_k = int(_get_optional_env("RETRIEVAL_SINGLE_COMPANY_TOP_K", "0"))
             self.llm_temperature = float(_get_optional_env("LLM_TEMPERATURE", "0.7"))
 
             # Guardrail Settings
@@ -208,6 +218,21 @@ class AzureConfig:
         if not 1 <= self.retrieval_top_k <= 100:
             raise ConfigurationError(f"RETRIEVAL_TOP_K must be between 1 and 100, got {self.retrieval_top_k}")
 
+        if not 1 <= self.retrieval_hybrid_knn <= 1000:
+            raise ConfigurationError(f"RETRIEVAL_HYBRID_KNN must be between 1 and 1000, got {self.retrieval_hybrid_knn}")
+
+        if not 0 <= self.retrieval_workbook_expand <= 100:
+            raise ConfigurationError(
+                f"RETRIEVAL_WORKBOOK_EXPAND must be between 0 and 100, got {self.retrieval_workbook_expand}")
+
+        if not 1 <= self.retrieval_workbook_trigger <= 100:
+            raise ConfigurationError(
+                f"RETRIEVAL_WORKBOOK_TRIGGER must be between 1 and 100, got {self.retrieval_workbook_trigger}")
+
+        if not 0 <= self.retrieval_single_company_top_k <= 100:
+            raise ConfigurationError(
+                f"RETRIEVAL_SINGLE_COMPANY_TOP_K must be between 0 and 100, got {self.retrieval_single_company_top_k}")
+
         if not 0.0 <= self.llm_temperature <= 2.0:
             raise ConfigurationError(f"LLM_TEMPERATURE must be between 0.0 and 2.0, got {self.llm_temperature}")
 
@@ -258,6 +283,12 @@ class AzureConfig:
         logger.info(f"Chunk Size: {self.chunk_size}")
         logger.info(f"Chunk Overlap: {self.chunk_overlap}")
         logger.info(f"Retrieval Top K: {self.retrieval_top_k}")
+        logger.info(f"Hybrid vector neighbours: {self.retrieval_hybrid_knn}")
+        logger.info(f"Workbook expansion: {self.retrieval_workbook_expand} "
+                    f"(when {self.retrieval_workbook_trigger} of the top results are workbook chunks)")
+        logger.info(f"Company routing: {self.retrieval_company_routing}"
+                    + (f" (one company: {self.retrieval_single_company_top_k} results)"
+                       if self.retrieval_single_company_top_k else ""))
         logger.info(f"LLM Temperature: {self.llm_temperature}")
         logger.info("-" * 60)
         logger.info(f"Guardrail Enabled: {self.guardrail_enabled}")

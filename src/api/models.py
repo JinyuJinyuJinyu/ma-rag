@@ -99,6 +99,17 @@ class QueryResponse(BaseModel):
     output_guardrail_details: Optional[Dict[str, Any]] = Field(
         None, description="Output guardrail category severities and triggers (Content Safety)"
     )
+    guardrail_reason: Optional[str] = Field(
+        None,
+        description="The guardrail agent's reason for its decision. For a guardrail that failed open, only the "
+                    "error type. None when Content Safety blocked the input before the guardrail agent ran, or "
+                    "when the output Content Safety check flagged the reason"
+    )
+    retrieval_query: Optional[str] = Field(
+        None,
+        description="What the retrieval agent searched with: the question, or for a follow-up a standalone "
+                    "rewrite of it. None when no retrieval ran, or when the output Content Safety check flagged it"
+    )
 
     class Config:
         json_schema_extra = {
@@ -107,6 +118,8 @@ class QueryResponse(BaseModel):
                 "question": "Which company had the highest revenue in calendar Q2 2026?",
                 "answer": "Alphabet had the highest revenue in calendar Q2 2026, $119,796 million, ahead of NVIDIA with $96,221 million (Source 1)...",
                 "intent": "comparison",
+                "guardrail_reason": "Question about the revenue of covered companies in a calendar quarter",
+                "retrieval_query": "Which company had the highest revenue in calendar Q2 2026?",
                 "input_guardrail": "nothing detected",
                 "output_guardrail": "nothing detected",
                 "session_id": "session_12345",
